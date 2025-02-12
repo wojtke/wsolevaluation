@@ -19,12 +19,15 @@ IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+from tqdm import tqdm
 import argparse
 import cv2
 import numpy as np
 import os
 from os.path import join as ospj
 import torch.utils.data as torchdata
+import torch
+import torch.nn.functional as F
 
 from config import str2bool
 from data_loaders import configure_metadata
@@ -168,15 +171,33 @@ def compute_bboxes_from_scoremaps(scoremap, scoremap_threshold_list,
     return estimated_boxes_at_each_thr, number_of_box_list
 
 
-class CamDataset(torchdata.Dataset):
-    def __init__(self, scoremap_path, image_ids):
-        self.scoremap_path = scoremap_path
+
+class CamDataset(torch.utils.data.Dataset):
+    def __init__(self, attn_maps_path, image_ids, metadata):
+        self.attn_maps = torch.load(attn_maps_path)
         self.image_ids = image_ids
+        self.id_to_index = {image_id: idx for idx, image_id in enumerate(image_ids)}
+        self.img_sizes = get_image_sizes(metadata)
+
+    def normalize(self, a):
+        a = a - a.min()
+        a = a / a.max()
+        return a.clip(0, 1)
 
     def _load_cam(self, image_id):
-        scoremap_file = os.path.join(self.scoremap_path, image_id + '.npy')
-        return np.load(scoremap_file)
-
+        index = self.id_to_index.get(image_id)
+        if index is None:
+            raise ValueError(f"Image ID {image_id} not found in dataset.")
+        attn_map = self.attn_maps[index]
+        img_size = self.img_sizes[image_id][::-1] 
+        attn_map = F.interpolate(
+            attn_map.unsqueeze(0).unsqueeze(0),
+            size=[224,224],
+            mode='nearest',
+        ).squeeze(0).squeeze(0)
+        attn_map = self.normalize(attn_map)
+        return attn_map
+    
     def __getitem__(self, index):
         image_id = self.image_ids[index]
         cam = self._load_cam(image_id)
@@ -280,11 +301,14 @@ class BoxEvaluator(LocalizationEvaluator):
         """
         max_box_acc = []
 
+
         for _THRESHOLD in self.iou_threshold_list:
             localization_accuracies = self.num_correct[_THRESHOLD] * 100. / \
                                       float(self.cnt)
+            print("iou", _THRESHOLD)
+            print("thresh", self.cam_threshold_list[localization_accuracies.argmax()])
             max_box_acc.append(localization_accuracies.max())
-
+        print("max_box_acc", max_box_acc)
         return max_box_acc
 
 
@@ -416,9 +440,9 @@ class MaskEvaluator(LocalizationEvaluator):
         return auc
 
 
-def _get_cam_loader(image_ids, scoremap_path):
+def _get_cam_loader(image_ids, scoremap_path, metadata):
     return torchdata.DataLoader(
-        CamDataset(scoremap_path, image_ids),
+        CamDataset(scoremap_path, image_ids, metadata),
         batch_size=128,
         shuffle=False,
         num_workers=4,
@@ -478,16 +502,29 @@ def evaluate_wsol(scoremap_root, metadata_root, mask_root, dataset_name, split,
                                  multi_contour_eval=multi_contour_eval,
                                  iou_threshold_list=iou_threshold_list)
 
-    cam_loader = _get_cam_loader(image_ids, scoremap_root)
-    for cams, image_ids in cam_loader:
+    cam_loader = _get_cam_loader(image_ids, scoremap_root, metadata)
+    i = 0
+    for cams, image_ids in tqdm(cam_loader, desc="camloader"):
         for cam, image_id in zip(cams, image_ids):
             evaluator.accumulate(t2n(cam), image_id)
+            # torch.save(cam, f"/net/tscratch/people/plgwoj/test/{image_id.replace('val/', '')}.pt")
+            # # print(image_id, img_size)
+            # i+=1
+            # if i == 10:
+            #     raise Exception
+
+        
     performance = evaluator.compute()
+
+    with open("/root/results", "a") as file:
+        file.write(f"{scoremap_root}{performance}")
+            
     if multi_iou_eval or dataset_name == 'OpenImages':
         performance = np.average(performance)
     else:
         performance = performance[iou_threshold_list.index(50)]
 
+    
     print('localization: {}'.format(performance))
     return performance
 
